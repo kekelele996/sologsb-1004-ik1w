@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import type { DeviceKind, DiffLine, LanguageDraft, ScriptStatus, Segment } from '~/types'
-import { LANGUAGES, useScriptStore } from '~/stores/script'
+import type { DeviceKind, DiffLine, LanguageDraft, ScriptStatus, Segment, SourceMatch } from '~/types'
+import { LANGUAGES, SAMPLE_IMPORT_LINES, SAMPLE_IMPORT_NOTE, SAMPLE_IMPORT_VERSION, parseCitations, useScriptStore } from '~/stores/script'
 
 const store = useScriptStore()
 const activeTab = ref('editor')
@@ -12,6 +12,12 @@ const compareA = ref('')
 const compareB = ref('')
 const helpDialog = ref(false)
 const deleteTarget = ref<string | null>(null)
+const importDialog = ref(false)
+const importVersion = ref('')
+const importNote = ref('')
+const importLines = ref('')
+const sourceForm = ref({ number: '', name: '', author: '' })
+const reconcileDialog = ref(false)
 
 const statusOptions: Array<{ value: ScriptStatus; label: string; color: string }> = [
   { value: 'draft', label: '草稿', color: 'grey' },
@@ -39,6 +45,18 @@ const diffLines = computed<DiffLine[]>(() => {
   const after = selectedVersionB.value?.draft.narration || ''
   return buildDiff(before, after)
 })
+// 资料核对：当前稿的引用与自由文本来源
+const narrationCitations = computed(() => parseCitations(draft.value?.narration || ''))
+const sourceEntries = computed<SourceMatch[]>(() => store.parseSourceEntries(draft.value?.sources || ''))
+const openFlags = computed(() => (draft.value?.reviewFlags || []).filter(flag => !flag.resolved))
+const totalOpenFlags = computed(() => store.openReviewCount)
+const reconcileReport = computed(() =>
+  store.lastReconcile && store.lastReconcile.exhibitId === store.selectedExhibitId
+    ? store.lastReconcile
+    : null
+)
+const reconcileIssues = computed(() => reconcileReport.value?.issues || [])
+const reconcileBackups = computed(() => store.reconcileBackups[store.selectedExhibitId] || {})
 
 onMounted(() => {
   store.hydrate()
@@ -106,6 +124,54 @@ function formatTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
 }
 function segmentLabel(segment: Segment) { return segment.label || '未命名段落' }
+
+// 资料目录
+function openImportDialog() {
+  importVersion.value = SAMPLE_IMPORT_VERSION
+  importNote.value = SAMPLE_IMPORT_NOTE
+  importLines.value = SAMPLE_IMPORT_LINES.join('\n')
+  importDialog.value = true
+}
+function submitImport() {
+  const lines = importLines.value.split('\n')
+  store.importCatalog({ version: importVersion.value, note: importNote.value, lines })
+  importDialog.value = false
+}
+function submitSource() {
+  store.addSource(sourceForm.value)
+  sourceForm.value = { number: '', name: '', author: '' }
+}
+function startReconcile() {
+  if (!store.selectedExhibitId) return
+  store.reconcileExhibit(store.selectedExhibitId)
+  reconcileDialog.value = true
+}
+function restoreLang(languageId: string) {
+  store.restoreLanguage(store.selectedExhibitId, languageId)
+}
+function citeStatus(number: string): 'ok' | 'deprecated' | 'orphan' {
+  const source = store.matchByNumber(number)
+  if (!source) return 'orphan'
+  if (source.status === 'deprecated') return 'deprecated'
+  return 'ok'
+}
+function citeColor(number: string): string {
+  const status = citeStatus(number)
+  return status === 'ok' ? 'success' : status === 'deprecated' ? 'warning' : 'error'
+}
+function citeLabel(number: string): string {
+  const status = citeStatus(number)
+  return status === 'ok' ? '正常' : status === 'deprecated' ? '已停用' : '已失去'
+}
+function issueColor(kind: string): string {
+  return ({ orphan: 'error', renamed: 'success', deprecated: 'warning', ok: 'success' } as Record<string, string>)[kind] || 'default'
+}
+function issueLabel(kind: string): string {
+  return ({ orphan: '失去资料', renamed: '已重算', deprecated: '已停用', ok: '正常' } as Record<string, string>)[kind] || kind
+}
+function langLabel(languageId: string): string {
+  return LANGUAGES.find(item => item.id === languageId)?.label || languageId
+}
 </script>
 
 <template>
@@ -118,6 +184,15 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
         <span class="text-caption text-medium-emphasis ms-3 d-none d-md-inline">展陈脚本工作台</span>
       </v-app-bar-title>
       <v-spacer />
+      <v-chip
+        v-if="totalOpenFlags > 0"
+        class="me-2"
+        color="error"
+        variant="tonal"
+        size="small"
+        prepend-icon="mdi-alert-circle-outline"
+        @click="activeTab = 'sources'"
+      >{{ totalOpenFlags }} 项待复核</v-chip>
       <v-chip class="me-2 d-none d-sm-flex" :color="currentStatus.color" variant="tonal" size="small">
         <span class="status-dot" :style="{ background: 'currentColor' }" />{{ currentStatus.label }}
       </v-chip>
@@ -197,6 +272,7 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
           <v-tab value="editor">脚本编辑</v-tab>
           <v-tab value="versions">版本比较</v-tab>
           <v-tab value="preview">设备预览</v-tab>
+          <v-tab value="catalog">资料目录</v-tab>
           <v-tab value="sources">资料核对</v-tab>
         </v-tabs>
 
@@ -345,27 +421,140 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                   <div class="preview-content">
                     <div class="text-overline text-medium-emphasis">{{ exhibit?.code }} · {{ currentLanguage?.label }}</div>
                     <h2 class="text-h4 font-weight-bold mt-2">{{ draft.title }}</h2>
-                    <p class="text-body-1 mt-6" style="line-height:1.9;white-space:pre-wrap">{{ draft.narration }}</p>
+                    <p class="text-body-1 mt-6" style="line-height:1.9;white-space:pre-wrap"><CiteText :text="draft.narration" /></p>
                     <v-divider class="my-6" />
                     <div class="section-title">无障碍描述</div>
                     <p class="text-body-2 mt-2" style="line-height:1.8;white-space:pre-wrap">{{ draft.accessibility }}</p>
+                    <div v-if="parseCitations(draft.narration).length" class="mt-6 text-caption text-medium-emphasis">
+                      本稿引用资料 {{ parseCitations(draft.narration).map(item => item.number).join('、') }}
+                    </div>
                     <div class="mt-7 text-caption text-medium-emphasis">预计讲解 {{ draft.durationMinutes }} 分钟</div>
                   </div>
                 </div>
               </v-card>
             </v-window-item>
 
+            <v-window-item value="catalog">
+              <v-row>
+                <v-col cols="12" md="7">
+                  <v-card class="script-card pa-5">
+                    <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-4">
+                      <div>
+                        <div class="section-title">当前资料目录</div>
+                        <div class="text-h6 font-weight-bold mt-1">{{ store.catalog.version }}</div>
+                        <div class="text-caption text-medium-emphasis mt-1">
+                          导入于 {{ formatTime(store.catalog.importedAt) }} · {{ store.activeSources.length }} 条在架
+                          <span v-if="store.catalog.note"> · {{ store.catalog.note }}</span>
+                        </div>
+                      </div>
+                      <v-btn color="primary" prepend-icon="mdi-database-import-outline" @click="openImportDialog">导入新版本</v-btn>
+                    </div>
+                    <v-alert type="info" variant="tonal" density="compact" class="mb-4">
+                      讲解词按编号引用（如 [S-001]）。每季升版后导入新目录，再按编号对账；已定稿讲解词不会自动改动，只把失去资料的引用标为待复核。
+                    </v-alert>
+                    <v-list density="compact" class="bg-transparent">
+                      <v-list-item v-for="source in store.catalog.sources" :key="source.id">
+                        <template #prepend>
+                          <v-chip size="small" :color="source.status === 'active' ? 'primary' : source.status === 'deprecated' ? 'warning' : 'default'" variant="tonal">{{ source.number }}</v-chip>
+                        </template>
+                        <v-list-item-title>{{ source.name }}</v-list-item-title>
+                        <v-list-item-subtitle>{{ source.author || '—' }} · {{ source.version }}</v-list-item-subtitle>
+                        <template #append>
+                          <v-chip v-if="source.status === 'removed'" size="x-small" color="error" variant="tonal" class="me-2">已移除</v-chip>
+                          <v-btn v-if="source.status === 'removed'" size="small" variant="text" @click="store.restoreSource(source.id)">恢复</v-btn>
+                          <v-btn v-else size="small" variant="text" color="error" @click="store.removeSource(source.id)">移除</v-btn>
+                        </template>
+                      </v-list-item>
+                    </v-list>
+                    <v-divider class="my-4" />
+                    <div class="section-title mb-2">新增资料</div>
+                    <v-row>
+                      <v-col cols="12" sm="3">
+                        <v-text-field v-model="sourceForm.number" label="编号" density="compact" hide-details placeholder="S-009" />
+                      </v-col>
+                      <v-col cols="12" sm="4">
+                        <v-text-field v-model="sourceForm.name" label="名称" density="compact" hide-details />
+                      </v-col>
+                      <v-col cols="12" sm="3">
+                        <v-text-field v-model="sourceForm.author" label="作者/出版者" density="compact" hide-details />
+                      </v-col>
+                      <v-col cols="12" sm="2">
+                        <v-btn color="primary" class="mt-1" block @click="submitSource">新增</v-btn>
+                      </v-col>
+                    </v-row>
+                  </v-card>
+                </v-col>
+                <v-col cols="12" md="5">
+                  <v-card class="script-card pa-5">
+                    <div class="section-title mb-3">季度对账</div>
+                    <p class="text-body-2 text-medium-emphasis mb-4">
+                      导入新目录后，对当前展项的中、英、日三稿按编号对账。草稿与退回段落按新版本重算编号；已定稿与待审不自动改文字；锁定段落留住原文。
+                    </p>
+                    <v-btn color="primary" prepend-icon="mdi-sync" block @click="startReconcile">开始对账（{{ exhibit?.code }}）</v-btn>
+                    <v-divider class="my-4" />
+                    <div class="section-title mb-2">历史版本</div>
+                    <v-list density="compact" class="bg-transparent">
+                      <v-list-item v-for="history in store.catalogHistory" :key="history.id">
+                        <v-list-item-title>{{ history.version }}</v-list-item-title>
+                        <v-list-item-subtitle>{{ formatTime(history.importedAt) }} · {{ history.sources.length }} 条</v-list-item-subtitle>
+                        <template #append><v-btn size="small" variant="outlined" @click="store.rollbackCatalog(history.id)">回滚</v-btn></template>
+                      </v-list-item>
+                      <v-list-item v-if="!store.catalogHistory.length" title="暂无历史版本" subtitle="导入新版本后，旧版本会留在此处" />
+                    </v-list>
+                  </v-card>
+                </v-col>
+              </v-row>
+            </v-window-item>
+
             <v-window-item value="sources">
               <v-row>
                 <v-col cols="12" md="7">
                   <v-card class="script-card pa-5">
+                    <div class="d-flex align-center justify-space-between mb-3">
+                      <div class="section-title">待复核标记</div>
+                      <v-btn v-if="openFlags.length" size="small" variant="text" @click="store.resolveAllFlags">全部标为已处理</v-btn>
+                    </div>
+                    <v-alert v-if="!openFlags.length" type="success" variant="tonal" density="compact" class="mb-4">本稿没有待复核引用。</v-alert>
+                    <div v-else class="d-flex flex-column ga-2 mb-4">
+                      <v-alert v-for="flag in openFlags" :key="flag.id" type="error" variant="tonal" density="compact" closable @click:close="store.resolveFlag(flag.id)">
+                        <strong>{{ flag.number }}</strong><span v-if="flag.name">（{{ flag.name }}）</span> · {{ flag.message }}
+                      </v-alert>
+                    </div>
+
+                    <div class="section-title mb-3">讲解词引用</div>
+                    <v-alert v-if="!narrationCitations.length" type="info" variant="tonal" density="compact" class="mb-4">讲解词中没有编号引用。可使用 [编号] 格式引用资料。</v-alert>
+                    <v-list v-else density="compact" class="bg-transparent mb-4">
+                      <v-list-item v-for="cite in narrationCitations" :key="cite.number + cite.index">
+                        <template #prepend>
+                          <v-chip size="small" :color="citeColor(cite.number)" variant="tonal">{{ cite.number }}</v-chip>
+                        </template>
+                        <v-list-item-subtitle>{{ store.matchByNumber(cite.number)?.name || '目录中无此编号' }}</v-list-item-subtitle>
+                        <template #append><v-chip size="x-small" :color="citeColor(cite.number)" variant="tonal">{{ citeLabel(cite.number) }}</v-chip></template>
+                      </v-list-item>
+                    </v-list>
+
                     <div class="section-title mb-3">来源与核验记录</div>
-                    <v-textarea :model-value="draft.sources" rows="8" @change="saveDraftField('sources', $event)" />
+                    <v-textarea :model-value="draft.sources" rows="6" hint="可填写编号引用（如 [S-001]）或自由文本来源；无编号来源按名称兼容匹配" persistent-hint @change="saveDraftField('sources', $event)" />
                     <v-alert class="mt-4" type="warning" variant="tonal">发布前请由内容负责人逐条核对来源。当前无障碍描述与实物尺寸需由教育部门复核。</v-alert>
                   </v-card>
                 </v-col>
                 <v-col cols="12" md="5">
                   <v-card class="script-card pa-5">
+                    <div class="section-title mb-3">来源匹配（按编号优先，无编号按名称）</div>
+                    <v-alert v-if="!sourceEntries.length" type="info" variant="tonal" density="compact">暂无来源记录。</v-alert>
+                    <v-list v-else density="compact" class="bg-transparent">
+                      <v-list-item v-for="(entry, index) in sourceEntries" :key="index">
+                        <template #prepend>
+                          <v-chip size="small" :color="entry.matched ? 'success' : 'error'" variant="tonal">
+                            {{ entry.by === 'number' ? '编号' : entry.by === 'name' ? '名称' : '未匹配' }}
+                          </v-chip>
+                        </template>
+                        <v-list-item-title class="text-body-2">{{ entry.name || entry.raw }}</v-list-item-title>
+                        <v-list-item-subtitle>{{ entry.raw }}</v-list-item-subtitle>
+                      </v-list-item>
+                    </v-list>
+                  </v-card>
+                  <v-card class="script-card pa-5 mt-5">
                     <div class="section-title mb-3">段落锁定概况</div>
                     <v-timeline density="compact" side="end">
                       <v-timeline-item v-for="segment in draft.segments" :key="segment.id" :dot-color="segment.locked ? 'success' : 'grey'" size="small">
@@ -414,6 +603,72 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
           </v-list>
         </v-card-text>
         <v-card-actions><v-spacer /><v-btn color="primary" @click="helpDialog = false">知道了</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="importDialog" max-width="640">
+      <v-card class="pa-3">
+        <v-card-title>导入新版本目录</v-card-title>
+        <v-card-text>
+          <p class="text-medium-emphasis mb-3">每行一条资料，格式：<code>编号|名称|作者</code>（也支持逗号/分号分隔）。旧目录会保留为历史版本，可随时回滚。</p>
+          <v-text-field v-model="importVersion" label="版本号（如 2026 Q3）" hide-details class="mb-3" />
+          <v-text-field v-model="importNote" label="版本说明" hide-details class="mb-3" />
+          <v-textarea v-model="importLines" label="资料清单" rows="10" hide-details />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn @click="importDialog = false">取消</v-btn>
+          <v-btn color="primary" @click="submitImport">导入并设为当前</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="reconcileDialog" max-width="760">
+      <v-card class="pa-3">
+        <v-card-title>对账结果</v-card-title>
+        <v-card-text>
+          <template v-if="reconcileReport">
+            <div class="d-flex flex-wrap align-center ga-2 mb-3">
+              <v-chip size="small" variant="tonal">{{ reconcileReport.exhibitTitle }}</v-chip>
+              <v-chip size="small" variant="outlined">{{ reconcileReport.fromVersion }} → {{ reconcileReport.toVersion }}</v-chip>
+              <span class="text-caption text-medium-emphasis">{{ formatTime(reconcileReport.ranAt) }}</span>
+            </div>
+            <v-alert type="info" variant="tonal" density="compact" class="mb-4">
+              已定稿与待审稿不自动改文字；草稿与退回稿按新版本重算编号；锁定段落留住原文。失去资料的引用已标为待复核。
+            </v-alert>
+            <div v-for="lang in LANGUAGES" :key="lang.id" class="mb-4">
+              <div class="d-flex align-center justify-space-between mb-2">
+                <div class="d-flex align-center ga-2">
+                  <strong>{{ lang.label }}</strong>
+                  <v-chip size="x-small" :color="exhibit?.drafts.find(item => item.languageId === lang.id) ? 'default' : 'grey'" variant="tonal">
+                    {{ exhibit?.drafts.find(item => item.languageId === lang.id) ? store.statusLabel(exhibit!.drafts.find(item => item.languageId === lang.id)!.status) : '尚未创建' }}
+                  </v-chip>
+                  <v-chip v-if="reconcileReport.changedLanguages.includes(lang.id)" size="x-small" color="success" variant="tonal">已重算</v-chip>
+                </div>
+                <v-btn size="small" variant="outlined" color="warning" :disabled="!reconcileBackups[lang.id]" @click="restoreLang(lang.id)">恢复此语言稿</v-btn>
+              </div>
+              <v-list density="compact" class="bg-transparent rounded-lg border">
+                <v-list-item v-for="(issue, index) in reconcileIssues.filter(item => item.languageId === lang.id)" :key="index">
+                  <template #prepend>
+                    <v-chip size="x-small" :color="issueColor(issue.kind)" variant="tonal">{{ issueLabel(issue.kind) }}</v-chip>
+                  </template>
+                  <v-list-item-title class="text-body-2">{{ issue.message }}</v-list-item-title>
+                  <template #append>
+                    <v-chip v-if="issue.applied" size="x-small" color="success" variant="tonal">已应用</v-chip>
+                    <v-chip v-else size="x-small" variant="tonal">保留原文</v-chip>
+                  </template>
+                </v-list-item>
+                <v-list-item v-if="!reconcileIssues.some(item => item.languageId === lang.id)" title="本语言稿无需调整" />
+              </v-list>
+            </div>
+          </template>
+          <v-alert v-else type="info" variant="tonal">尚未对当前展项执行对账。请先在「资料目录」页导入新版本，再点击「开始对账」。</v-alert>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn color="warning" variant="outlined" @click="store.restoreAllLanguages(store.selectedExhibitId)">全部恢复</v-btn>
+          <v-btn color="primary" @click="reconcileDialog = false">完成</v-btn>
+        </v-card-actions>
       </v-card>
     </v-dialog>
 
